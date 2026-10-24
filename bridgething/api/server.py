@@ -26,6 +26,7 @@ from .ncm import (
 )
 from .playback import player_state_from_ha, transport_service
 from .protocol import decode_frames
+from .spotify import SpotifyError, SpotifySession
 from .state import AppState
 
 log = logging.getLogger("bridgething")
@@ -34,11 +35,13 @@ SOURCE_PATH = "/data/source_entity"
 
 
 class Companion:
-    def __init__(self, state: AppState | None = None, ha: HomeAssistant | None = None) -> None:
+    def __init__(self, state: AppState | None = None, ha: HomeAssistant | None = None, spotify: SpotifySession | None = None) -> None:
         self.state = state or AppState()
         self.ha = ha or HomeAssistant()
-        self.gateway = GatewaySession(self.state, self.ha)
+        self.spotify = spotify or SpotifySession()
+        self.gateway = GatewaySession(self.state, self.ha, self.spotify)
         self.device = DeviceSession(self.state)
+        self.state.update(spotify=self.spotify.status())
         self.stop = threading.Event()
 
     def apply_source(self, entity_id: str) -> None:
@@ -61,10 +64,22 @@ class Companion:
         self.state.set_playback(player)
 
     def transport(self, event: str, body: dict[str, Any] | None = None) -> str | None:
+        payload = body or {}
+        if self.spotify.logged_in:
+            try:
+                handled = self.spotify.command(event, payload)
+            except SpotifyError as exc:
+                return exc.detail or exc.kind
+            if handled:
+                try:
+                    self.state.set_playback(self.spotify.now_playing())
+                except SpotifyError as exc:
+                    log.warning("spotify player unavailable: %s", exc.detail or exc.kind)
+                return None
         entity = str(self.state.get("sourceEntity") or "")
         if not entity:
             return "no active transport"
-        service = transport_service(event, body or {}, entity)
+        service = transport_service(event, payload, entity)
         if service is None:
             return "unsupported"
         self.ha.call_service(*service)
@@ -141,6 +156,12 @@ def _need(companion: Companion, key: str, message: str) -> None:
 def route_post(companion: Companion, path: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     device = companion.device
     gateway = companion.gateway
+    if path == "/spotify/credentials":
+        status = companion.spotify.adopt(body)
+        companion.state.update(spotify=status)
+        if companion.state.get("gatewayConnected"):
+            companion.gateway.sync_playback(force=True)
+        return 200, {"spotify": status}
     if path == "/playback/source":
         companion.apply_source(str(body.get("entity_id") or ""))
         return 200, companion.state.snapshot()
@@ -311,11 +332,23 @@ def device_loop(companion: Companion) -> None:
 
 def playback_loop(companion: Companion) -> None:
     while not companion.stop.is_set():
+        if companion.spotify.logged_in:
+            try:
+                player = companion.spotify.now_playing()
+            except SpotifyError as exc:
+                log.info("spotify player unavailable: %s", exc.detail or exc.kind)
+                player = None
+            current = companion.state.get("playback") or {}
+            showing_spotify = isinstance(current, dict) and current.get("origin") == "spotify"
+            if isinstance(player, dict) and (player.get("track") or showing_spotify):
+                companion.state.set_playback(player)
+                companion.stop.wait(1)
+                continue
         entity = str(companion.state.get("sourceEntity") or "")
         ha_state = companion.ha.get_state(entity) if entity else None
         if isinstance(ha_state, dict):
             companion.state.set_playback(player_state_from_ha(entity, ha_state))
-        companion.stop.wait(2)
+        companion.stop.wait(1)
 
 
 class ReuseHTTPServer(ThreadingHTTPServer):

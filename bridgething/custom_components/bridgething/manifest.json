@@ -3,9 +3,10 @@
   "name": "Bridgething",
   "codeowners": [],
   "config_flow": true,
-  "documentation": "https://github.com/JoeyEamigh/bridgething",
+  "dependencies": ["application_credentials"],
+  "documentation": "https://github.com/umousesonic/bridgething-homeassistant",
   "integration_type": "device",
   "iot_class": "local_polling",
   "requirements": [],
-  "version": "0.1.6"
+  "version": "0.1.49"
 }

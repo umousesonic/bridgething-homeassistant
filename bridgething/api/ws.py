@@ -103,7 +103,7 @@ def connect(
         path = "/" + path
     lines = [
         f"GET {path} HTTP/1.1",
-        f"Host: {host}:{port}",
+        f"Host: {host}" if port in (80, 443) else f"Host: {host}:{port}",
         "Upgrade: websocket",
         "Connection: Upgrade",
         f"Sec-WebSocket-Key: {key}",

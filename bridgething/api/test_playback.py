@@ -48,7 +48,10 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual(session.sent[0]["data"]["data"]["data"]["musicProvider"], "spotify")
         self.assertTrue(session.sent[0]["data"]["data"]["data"]["available"]["netFetch"])
         claims = [item for item in session.sent if item["data"]["data"]["event"] == "claim"]
-        self.assertEqual([item["data"]["data"]["data"]["scope"] for item in claims], ["nowPlayingMetadata", "nowPlayingPlayback"])
+        self.assertEqual(
+            [item["data"]["data"]["data"]["scope"] for item in claims],
+            ["nowPlayingMetadata", "nowPlayingPlayback", "volume"],
+        )
         self.assertEqual(claims[0]["data"]["data"]["data"]["appBundle"], "com.spotify.client")
         snapshot = next(item for item in session.sent if item["data"]["data"]["event"] == "snapshot" and item["data"]["type"] == "player")
         track = snapshot["data"]["data"]["data"]["track"]
@@ -66,7 +69,47 @@ class PlaybackTests(unittest.TestCase):
         session.handle({"id": "v", "meta": {"kind": "event"}, "data": {"type": "version", "data": {"serialNumber": "S"}}})
         events = [item["data"]["data"]["event"] for item in session.sent if item["data"]["type"] in ("authority", "player")]
         self.assertNotIn("claim", events)
-        self.assertIn("snapshot", events)
+        self.assertEqual(events, ["snapshot"])
+        snapshot = next(item for item in session.sent if item["data"]["type"] == "player")
+        body = snapshot["data"]["data"]["data"]
+        self.assertNotIn("track", body)
+        self.assertNotIn("context", body)
+        self.assertEqual(
+            body["playback"],
+            {
+                "state": "paused",
+                "positionMs": 0,
+                "shuffle": False,
+                "shuffleMode": "off",
+                "repeat": "off",
+                "setElapsedTimeAvailable": False,
+            },
+        )
+        self.assertEqual(body["queue"], [])
+        self.assertEqual(body["options"], {"speed": 1.0})
+
+    def test_going_idle_releases_authority_before_the_paused_snapshot(self) -> None:
+        state = AppState()
+        state.set_playback(player_state_from_ha("media_player.spotify_kitchen", _playing()))
+        session = GatewaySession(state, HomeAssistant(token=""))
+        session.handle({"id": "v", "meta": {"kind": "event"}, "data": {"type": "version", "data": {"serialNumber": "S"}}})
+        sent_before = len(session.sent)
+        state.set_playback(player_state_from_ha("media_player.spotify_kitchen", None))
+        session.sync_playback()
+        follow = [(item["data"]["type"], item["data"]["data"]["event"]) for item in session.sent[sent_before:]]
+        self.assertEqual(
+            follow,
+            [
+                ("authority", "release"),
+                ("authority", "release"),
+                ("authority", "release"),
+                ("player", "snapshot"),
+            ],
+        )
+        released = [item["data"]["data"]["data"]["scope"] for item in session.sent[sent_before : sent_before + 3]]
+        self.assertEqual(released, ["nowPlayingMetadata", "nowPlayingPlayback", "volume"])
+        self.assertNotIn("track", session.sent[-1]["data"]["data"]["data"])
+        self.assertEqual(session.sent[-1]["data"]["data"]["data"]["playback"]["state"], "paused")
 
     def test_device_transport_calls_the_source_player(self) -> None:
         state = AppState()

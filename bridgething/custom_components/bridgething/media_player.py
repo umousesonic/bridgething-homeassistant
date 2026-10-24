@@ -1,6 +1,6 @@
 """The screen mirror. Transport buttons go to the media player that owns the sound."""
 
-from homeassistant.components.media_player import MediaPlayerEntity, MediaPlayerEntityFeature, MediaPlayerState
+from homeassistant.components.media_player import MediaPlayerEntity, MediaPlayerEntityFeature, MediaPlayerState, RepeatMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -25,8 +25,10 @@ class NowPlaying(BridgethingEntity, MediaPlayerEntity):
         MediaPlayerEntityFeature.PLAY
         | MediaPlayerEntityFeature.PAUSE
         | MediaPlayerEntityFeature.NEXT_TRACK
-        | MediaPlayerEntityFeature.PREVIOUS_TRACK
+        |         MediaPlayerEntityFeature.PREVIOUS_TRACK
         | MediaPlayerEntityFeature.SEEK
+        | MediaPlayerEntityFeature.SHUFFLE_SET
+        | MediaPlayerEntityFeature.REPEAT_SET
     )
 
     def __init__(self, coordinator) -> None:
@@ -55,6 +57,18 @@ class NowPlaying(BridgethingEntity, MediaPlayerEntity):
     def media_album_name(self) -> str | None:
         track = self._track()
         return track.get("album") or None
+
+    @property
+    def media_image_url(self) -> str | None:
+        picture = self._player().get("picture")
+        if isinstance(picture, str) and picture.startswith("http"):
+            return picture
+        return None
+
+    @property
+    def media_content_id(self) -> str | None:
+        uri = self._track().get("uri")
+        return uri if isinstance(uri, str) and uri else None
 
     @property
     def media_position(self) -> int | None:
@@ -88,6 +102,13 @@ class NowPlaying(BridgethingEntity, MediaPlayerEntity):
 
     async def async_media_seek(self, position: float) -> None:
         await self.coordinator.async_post("/playback/command", {"event": "seekTo", "data": {"positionMs": int(position * 1000)}})
+
+    async def async_set_shuffle(self, shuffle: bool) -> None:
+        await self.coordinator.async_post("/playback/command", {"event": "setShuffle", "data": {"on": shuffle}})
+
+    async def async_set_repeat(self, repeat: RepeatMode) -> None:
+        mode = repeat.value if isinstance(repeat, RepeatMode) else str(repeat)
+        await self.coordinator.async_post("/playback/command", {"event": "setRepeat", "data": {"mode": mode}})
 
     async def _command(self, event: str) -> None:
         await self.coordinator.async_post("/playback/command", {"event": event})

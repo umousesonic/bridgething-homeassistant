@@ -65,6 +65,7 @@ def _current_app(data: dict):
 
 SENSORS = (
     SensorDesc("current_app", "Current app", _current_app, True),
+    SensorDesc("spotify_account", "Spotify account", lambda data: _clip((data.get("spotify") or {}).get("username")), True),
     SensorDesc("ambient", "Ambient light", lambda data: _hardware(data).get("ambientLevel"), True, "%", None, SensorStateClass.MEASUREMENT),
     SensorDesc(
         "effective_backlight",

@@ -42,6 +42,7 @@ class AppState:
             "logLine": None,
             "navigateUrl": "",
             "profile": None,
+            "spotify": {"loggedIn": False, "username": None},
         }
 
     def update(self, **kwargs: Any) -> None:

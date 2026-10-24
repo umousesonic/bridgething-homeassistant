@@ -56,6 +56,18 @@ def playback_state(state: str) -> str:
     return "stopped"
 
 
+def idle_playback() -> dict[str, Any]:
+    """No-track snapshot the stock companion sends. Playback stays paused, and the track is omitted."""
+    return {
+        "state": "paused",
+        "positionMs": 0,
+        "shuffle": False,
+        "shuffleMode": "off",
+        "repeat": "off",
+        "setElapsedTimeAvailable": False,
+    }
+
+
 def player_state_from_ha(entity_id: str, ha_state: dict[str, Any] | None) -> dict[str, Any]:
     attributes = (ha_state or {}).get("attributes") or {}
     state = playback_state(str((ha_state or {}).get("state") or "idle"))
@@ -63,7 +75,7 @@ def player_state_from_ha(entity_id: str, ha_state: dict[str, Any] | None) -> dic
     if state == "stopped" or title is None:
         return {
             "track": None,
-            "playback": {"state": "stopped", "positionMs": 0, "shuffle": False, "repeat": "off"},
+            "playback": idle_playback(),
             "queue": [],
             "options": {"speed": 1.0},
             "entityId": entity_id,
@@ -74,6 +86,7 @@ def player_state_from_ha(entity_id: str, ha_state: dict[str, Any] | None) -> dic
     picture = _text(attributes.get("entity_picture"))
     track = {
         "uri": uri,
+        "persistentId": uri,
         "title": title,
         "artist": _text(attributes.get("media_artist")) or "",
         "album": _text(attributes.get("media_album_name")) or "",
@@ -99,6 +112,7 @@ def player_state_from_ha(entity_id: str, ha_state: dict[str, Any] | None) -> dic
             "positionAgeMs": 0,
             "shuffle": bool(attributes.get("shuffle")),
             "repeat": repeat_to_device(attributes.get("repeat")),
+            "setElapsedTimeAvailable": True,
         },
         "queue": [item],
         "options": {"speed": 1.0},
@@ -118,12 +132,34 @@ def queue_snapshot(player: dict[str, Any]) -> dict[str, Any]:
 
 
 def wire_player_state(player: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "track": player.get("track"),
-        "playback": player.get("playback") or {"state": "stopped", "positionMs": 0},
+    track = player.get("track")
+    if not isinstance(track, dict) or not track:
+        playback = player.get("playback") if isinstance(player.get("playback"), dict) else {}
+        shuffled = bool(playback.get("shuffle"))
+        position = playback.get("positionMs")
+        repeat = playback.get("repeat")
+        return {
+            "playback": {
+                "state": "paused",
+                "positionMs": int(position) if isinstance(position, (int, float)) and not isinstance(position, bool) else 0,
+                "shuffle": shuffled,
+                "shuffleMode": "songs" if shuffled else "off",
+                "repeat": repeat if repeat in ("off", "all", "one") else "off",
+                "setElapsedTimeAvailable": False,
+            },
+            "queue": [],
+            "options": {"speed": 1.0},
+        }
+    payload = {
+        "track": track,
+        "playback": player.get("playback") or {"state": "paused", "positionMs": 0},
         "queue": player.get("queue") or [],
         "options": player.get("options") or {"speed": 1.0},
     }
+    context = player.get("context")
+    if isinstance(context, dict) and context.get("uri"):
+        payload["context"] = {"uri": context["uri"], "name": context.get("name")}
+    return payload
 
 
 def brightness_commands(percent: float) -> list[tuple[str, str, dict[str, Any], str]]:

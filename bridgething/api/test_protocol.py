@@ -4,7 +4,8 @@ import struct
 import unittest
 import uuid
 
-from api.protocol import decode_frames, dumps, encode_frame, encode_json, envelope, normalize_msgpack, unpack_msgpack
+from api.art import art_url, asset_id_for, with_edge
+from api.protocol import as_bytes, decode_frames, dumps, encode_frame, encode_json, encode_msgpack, encode_wire, envelope, normalize_msgpack, unpack_msgpack
 
 
 class FrameTests(unittest.TestCase):
@@ -55,3 +56,39 @@ class FrameTests(unittest.TestCase):
         self.assertEqual(parsed["data"]["data"]["event"], "displaySetMode")
         self.assertEqual(parsed["data"]["data"]["data"]["mode"], "manual")
         self.assertIsNone(parsed["meta"].get("data"))
+
+    def test_artwork_ids_round_trip_the_edge_the_device_rewrites(self) -> None:
+        scdn = asset_id_for("https://i.scdn.co/image/deadbeef")
+        self.assertEqual(scdn, "spotify/img/248/ideadbeef")
+        self.assertEqual(with_edge(scdn or "", 96), "spotify/img/96/ideadbeef")
+        self.assertEqual(art_url("spotify/img/96/ideadbeef"), "https://i.scdn.co/image/deadbeef")
+        foreign = "https://example.com/a b/c?x=1&y=Ü"
+        encoded = asset_id_for(foreign, 96)
+        self.assertTrue(encoded and encoded.startswith("spotify/img/96/u"))
+        self.assertEqual(art_url(with_edge(encoded or "", 248)), foreign)
+        self.assertIsNone(art_url("spotify/img/248/xdeadbeef"))
+        self.assertEqual(with_edge("builtin/img/liked-songs", 96), "builtin/img/liked-songs")
+
+    def test_gateway_output_uses_the_0_1_18_json_compatibility_format(self) -> None:
+        message = envelope(
+            "response",
+            "asset",
+            "got",
+            {"id": "spotify/img/96/ideadbeef", "mime": "image/jpeg", "body": {"type": "inline", "data": b"\xff\xd8\xff"}},
+        )
+        frame = encode_wire(message)
+        self.assertEqual(frame[4], 1)
+        decoded = decode_frames(bytearray(frame))[0]
+        self.assertEqual(as_bytes(decoded["data"]["data"]["data"]["body"]["data"]), b"\xff\xd8\xff")
+        plain = encode_wire(envelope("event", "player", "snapshot", {"track": None}))
+        self.assertEqual(plain[4], 1)
+        decoded_plain = decode_frames(bytearray(plain))[0]
+        self.assertIsInstance(decoded_plain["id"], str)
+        uuid.UUID(decoded_plain["id"])
+
+    def test_optional_official_msgpack_encoder_uses_automatic_gzip(self) -> None:
+        message = envelope("event", "test", "large", {"value": "a" * (16 * 1024)})
+        frame = encode_msgpack(message)
+        self.assertEqual(frame[3], 1)
+        self.assertEqual(frame[4], 0)
+        self.assertEqual(decode_frames(bytearray(frame)), [message])

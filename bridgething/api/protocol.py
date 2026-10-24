@@ -18,6 +18,7 @@ ENCODING_JSON = 1
 ENCODING_MSGPACK = 0
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_PAYLOAD = 16 * 1024 * 1024
+AUTO_GZIP_THRESHOLD = 16 * 1024 - 128
 
 UUID_KEYS = {
     "id",
@@ -49,6 +50,113 @@ def encode_frame(payload: bytes, *, compression: int = 0, encoding: int = ENCODI
 
 def encode_json(message: dict[str, Any]) -> bytes:
     return encode_frame(dumps(message).encode("utf-8"))
+
+
+def encode_msgpack(message: dict[str, Any]) -> bytes:
+    payload = pack_msgpack(message)
+    if len(payload) > AUTO_GZIP_THRESHOLD:
+        compressed = gzip.compress(payload, compresslevel=1, mtime=0)
+        if len(compressed) < len(payload):
+            return encode_frame(compressed, compression=1, encoding=ENCODING_MSGPACK)
+    return encode_frame(payload, encoding=ENCODING_MSGPACK)
+
+
+def encode_wire(message: dict[str, Any]) -> bytes:
+    """Compatibility wire format used by 0.1.18 and accepted by old and current Bridgething."""
+    return encode_json(message)
+
+
+def pack_msgpack(value: Any, key: str | None = None) -> bytes:
+    if value is None:
+        return b"\xc0"
+    if value is False:
+        return b"\xc2"
+    if value is True:
+        return b"\xc3"
+    if isinstance(value, bytes):
+        return _pack_bin(value)
+    if isinstance(value, str):
+        if key in UUID_KEYS:
+            try:
+                return _pack_bin(uuid.UUID(value).bytes)
+            except ValueError:
+                pass
+        return _pack_str(value)
+    if isinstance(value, int):
+        return _pack_int(value)
+    if isinstance(value, float):
+        return b"\xcb" + struct.pack(">d", value)
+    if isinstance(value, list):
+        return _pack_array([pack_msgpack(item) for item in value])
+    if isinstance(value, dict):
+        packed = [pack_msgpack(str(item_key)) + pack_msgpack(item, str(item_key)) for item_key, item in value.items()]
+        return _pack_map(packed)
+    if isinstance(value, uuid.UUID):
+        return _pack_str(str(value))
+    raise TypeError(f"cannot pack {type(value).__name__}")
+
+
+def _pack_str(value: str) -> bytes:
+    raw = value.encode("utf-8")
+    size = len(raw)
+    if size <= 31:
+        return bytes([0xA0 | size]) + raw
+    if size <= 255:
+        return bytes([0xD9, size]) + raw
+    if size <= 65535:
+        return b"\xda" + struct.pack(">H", size) + raw
+    return b"\xdb" + struct.pack(">I", size) + raw
+
+
+def _pack_bin(value: bytes) -> bytes:
+    size = len(value)
+    if size <= 255:
+        return bytes([0xC4, size]) + value
+    if size <= 65535:
+        return b"\xc5" + struct.pack(">H", size) + value
+    return b"\xc6" + struct.pack(">I", size) + value
+
+
+def _pack_int(value: int) -> bytes:
+    if 0 <= value <= 127:
+        return bytes([value])
+    if -32 <= value < 0:
+        return bytes([value & 0xFF])
+    if 0 <= value <= 0xFF:
+        return bytes([0xCC, value])
+    if 0 <= value <= 0xFFFF:
+        return b"\xcd" + struct.pack(">H", value)
+    if 0 <= value <= 0xFFFFFFFF:
+        return b"\xce" + struct.pack(">I", value)
+    if value >= 0:
+        return b"\xcf" + struct.pack(">Q", value)
+    if value >= -128:
+        return b"\xd0" + struct.pack(">b", value)
+    if value >= -32768:
+        return b"\xd1" + struct.pack(">h", value)
+    if value >= -2147483648:
+        return b"\xd2" + struct.pack(">i", value)
+    return b"\xd3" + struct.pack(">q", value)
+
+
+def _pack_array(items: list[bytes]) -> bytes:
+    size = len(items)
+    body = b"".join(items)
+    if size <= 15:
+        return bytes([0x90 | size]) + body
+    if size <= 65535:
+        return b"\xdc" + struct.pack(">H", size) + body
+    return b"\xdd" + struct.pack(">I", size) + body
+
+
+def _pack_map(items: list[bytes]) -> bytes:
+    size = len(items)
+    body = b"".join(items)
+    if size <= 15:
+        return bytes([0x80 | size]) + body
+    if size <= 65535:
+        return b"\xde" + struct.pack(">H", size) + body
+    return b"\xdf" + struct.pack(">I", size) + body
 
 
 def decode_frames(buffer: bytearray) -> list[dict[str, Any]]:

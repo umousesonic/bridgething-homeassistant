@@ -8,14 +8,50 @@
           "url": "App URL",
           "source": "Media player"
         }
+      },
+      "spotify": {
+        "title": "Spotify",
+        "description": "Log in so this companion can use your Spotify account. The Car Thing does not receive the token.",
+        "menu_options": {
+          "connect": "Log in to Spotify",
+          "skip_spotify": "Continue without Spotify"
+        }
+      },
+      "connect": {
+        "title": "Log in to Spotify",
+        "description": "Click the link below. That opens the Spotify login page. Approve access there.\n\n[Open the Spotify login page]({authorize_url})\n\nAfter you approve, the browser goes to a page at 127.0.0.1 that fails to load. Copy the full address from the browser bar into **Address from the browser bar**.",
+        "data": {
+          "login_url": "Spotify login address",
+          "redirect": "Address from the browser bar"
+        }
+      },
+      "auth": {
+        "title": "Log in to Spotify",
+        "description": "Approve access on the Spotify page, then paste the address the browser tried to open."
+      },
+      "reauth_confirm": {
+        "title": "Spotify login expired",
+        "description": "Log in again. The new token stays on this companion."
+      },
+      "reconfigure": {
+        "title": "Log in to Spotify",
+        "description": "Continue to open the Spotify login page."
       }
     },
     "error": {
-      "cannot_connect": "The Bridgething app did not answer. Check that the app is started."
+      "cannot_connect": "The Bridgething app did not answer. Check that the app is started.",
+      "invalid_auth": "That address did not include a Spotify login code. Copy the full address from the browser bar.",
+      "oauth_failed": "Spotify rejected the login. Open the address again and paste the new redirect."
     },
     "abort": {
       "already_configured": "This Car Thing is already configured.",
-      "cannot_connect": "The Bridgething app did not answer. It will be tried again when the app starts."
+      "cannot_connect": "The Bridgething app did not answer. It will be tried again when the app starts.",
+      "missing_configuration": "Add a Spotify application credential first. In the Spotify developer dashboard, set the redirect URI to https://my.home-assistant.io/redirect/oauth.",
+      "oauth_error": "Spotify did not finish the login.",
+      "oauth_failed": "Spotify rejected the login.",
+      "oauth_timeout": "The Spotify login timed out.",
+      "reauth_successful": "Spotify login updated.",
+      "reconfigure_successful": "Spotify login updated."
     }
   },
   "options": {
@@ -34,6 +70,9 @@
     "error": {
       "cannot_connect": "The Bridgething app did not answer."
     }
+  },
+  "application_credentials": {
+    "description": "Spotify login no longer uses a developer app. Use Log in to Spotify on the Bridgething setup instead."
   },
   "services": {
     "set_brightness": {

@@ -14,6 +14,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .config_flow import _spotify_user_id
 from .const import CONF_SOURCE, CONF_URL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -82,9 +83,36 @@ class BridgethingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.async_request_refresh()
         return result
 
+    async def async_push_spotify(self) -> None:
+        """Give the companion the Spotify login. The companion refreshes it, and the Car Thing never sees it."""
+        token = self.entry.data.get("token")
+        if not isinstance(token, dict) or not token.get("access_token"):
+            return
+        username = self.entry.data.get("username")
+        if not isinstance(username, str) or not username:
+            try:
+                username = await self.hass.async_add_executor_job(
+                    _spotify_user_id, token.get("access_token") or ""
+                )
+            except Exception:
+                username = None
+        body = {
+            "access_token": token.get("access_token") or "",
+            "refresh_token": token.get("refresh_token") or "",
+            "expires_at": token.get("expires_at") or 0,
+            "client_id": "65b708073fc0480ea92a077233ca87bd",
+        }
+        if isinstance(username, str) and username:
+            body["username"] = username
+        try:
+            await self.hass.async_add_executor_job(self._post, "/spotify/credentials", body)
+        except Exception:
+            _LOGGER.exception("Could not give the companion its Spotify token")
+
     async def async_watch_source(self) -> None:
         self.async_unwatch()
         entity_id = self.source_entity()
+        await self.async_push_spotify()
         await self.hass.async_add_executor_job(self._post, "/playback/source", {"entity_id": entity_id})
         if not entity_id:
             return

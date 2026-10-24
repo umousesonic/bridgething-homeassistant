@@ -170,23 +170,13 @@ class DeviceSession:
         self.send(envelope("request", "system", "diagnosticsGet"))
 
     def _hello(self) -> None:
+        # This firmware accepts only versionRequest and diagnosticsGet on the system surface.
         self.send(envelope("request", "system", "versionRequest"))
         self.send(envelope("request", "hardware", "stateGet"))
         self.send(envelope("request", "system", "diagnosticsGet"))
         self.send(envelope("request", "webapp", "list"))
         self.send(envelope("request", "webapp", "current"))
         self.send(envelope("request", "bluetooth", "list"))
-        self.send(envelope("request", "system", "deviceGetNickname"))
-        self.send(envelope("request", "system", "launcherGestureGet"))
-        self.send(envelope("request", "system", "companionLaunchGet"))
-        self.send(
-            envelope(
-                "request",
-                "system",
-                "logsTail",
-                {"source": "all", "levels": ["warn", "error"], "maxLines": 1},
-            )
-        )
 
     def _dispatch(self, message: dict[str, Any]) -> None:
         surface = outer_type(message)

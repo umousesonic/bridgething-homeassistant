@@ -21,12 +21,13 @@ from .playback import (
     transport_service,
     wire_player_state,
 )
+from .spotify import SpotifyError, SpotifySession, library_error
 from .protocol import as_bytes, envelope, error_response, inner_event, kind_of, outer_type, request_id_of, response_request_id
 from .state import AppState
 from .ws import WebSocket, connect
 
 log = logging.getLogger("bridgething.gateway")
-SCOPES = ("nowPlayingMetadata", "nowPlayingPlayback")
+SCOPES = ("nowPlayingMetadata", "nowPlayingPlayback", "volume")
 
 
 class Pending:
@@ -35,8 +36,8 @@ class Pending:
         self.result: dict[str, Any] | None = None
 
 
-def capabilities(entity_id: str) -> dict[str, Any]:
-    provider = music_provider(entity_id)
+def capabilities(entity_id: str, logged_in: bool = False) -> dict[str, Any]:
+    provider = "spotify" if logged_in or music_provider(entity_id) == "spotify" else "none"
     return {
         "gateway": {
             "address": "home-assistant",
@@ -65,6 +66,19 @@ def capabilities(entity_id: str) -> dict[str, Any]:
     }
 
 
+def _favorite_uris(body: dict[str, Any]) -> list[str]:
+    raw = body.get("uris")
+    if not isinstance(raw, list):
+        raw = body.get("items") if isinstance(body.get("items"), list) else []
+    found: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item:
+            found.append(item)
+        elif isinstance(item, dict) and item.get("uri"):
+            found.append(str(item["uri"]))
+    return found
+
+
 def time_info() -> dict[str, Any]:
     now = datetime.datetime.now().astimezone()
     offset = now.utcoffset()
@@ -79,9 +93,10 @@ def time_info() -> dict[str, Any]:
 
 
 class GatewaySession:
-    def __init__(self, state: AppState, ha: HomeAssistant, *, inline_net: bool = False) -> None:
+    def __init__(self, state: AppState, ha: HomeAssistant, spotify: SpotifySession | None = None, *, inline_net: bool = False) -> None:
         self.state = state
         self.ha = ha
+        self.spotify = spotify
         self.inline_net = inline_net
         self.sent: list[dict[str, Any]] = []
         self.lock = threading.Lock()
@@ -92,11 +107,12 @@ class GatewaySession:
         self.sent_generation = -1
         self.tunnels: dict[str, Tunnel] = {}
         self.upstreams: dict[str, WebSocket] = {}
+        self.sent_volume: dict[str, Any] | None = None
 
     def connect(self, host: str) -> None:
         self.close()
         self.ws = connect(host, GATEWAY_PORT)
-        self.ws.sock.settimeout(1.0)
+        self.ws.sock.settimeout(0.35)
         self.claimed = False
         self.announced_provider = None
         self.sent_generation = -1
@@ -118,10 +134,17 @@ class GatewaySession:
             self.ws = None
         self.state.update(gatewayConnected=False)
 
-    def send(self, message: dict[str, Any]) -> None:
-        from .protocol import encode_json
+    def _off_socket(self, target: Any, *args: Any) -> None:
+        """Library and artwork answers can take a moment. The socket still has to read keepalives."""
+        if self.ws is None or self.inline_net:
+            target(*args)
+            return
+        threading.Thread(target=target, args=args, daemon=True).start()
 
-        payload = encode_json(message)
+    def send(self, message: dict[str, Any]) -> None:
+        from .protocol import encode_wire
+
+        payload = encode_wire(message)
         with self.lock:
             self.sent.append(message)
             ws = self.ws
@@ -158,12 +181,13 @@ class GatewaySession:
         if not force and generation == self.sent_generation:
             return
         self.sent_generation = generation
-        provider = music_provider(entity)
+        logged_in = bool(self.spotify and self.spotify.logged_in)
+        provider = "spotify" if logged_in else music_provider(entity)
         if self.announced_provider != provider:
-            self.send(envelope("event", "capabilities", "announce", capabilities(entity)))
+            self.send(envelope("event", "capabilities", "announce", capabilities(entity, logged_in)))
             self.announced_provider = provider
         want = has_track(player)
-        bundle = app_bundle(entity)
+        bundle = "com.spotify.client" if logged_in else app_bundle(entity)
         if want and not self.claimed:
             for scope in SCOPES:
                 self.send(envelope("event", "authority", "claim", {"scope": scope, "appBundle": bundle}))
@@ -173,7 +197,9 @@ class GatewaySession:
                 self.send(envelope("event", "authority", "release", {"scope": scope}))
             self.claimed = False
         self.send(envelope("event", "player", "snapshot", wire_player_state(player)))
-        self.send(envelope("event", "player", "queueChanged", queue_snapshot(player)))
+        if want:
+            self.send(envelope("event", "player", "queueChanged", queue_snapshot(player)))
+        self._publish_volume(player.get("volume") if isinstance(player, dict) else None)
 
     def navigate(self, url: str) -> None:
         self.state.update(navigateUrl=url)
@@ -203,8 +229,9 @@ class GatewaySession:
         if surface == "version" and isinstance(body, dict):
             self.state.apply_meta(body)
             entity = str(self.state.get("sourceEntity") or "")
-            self.send(envelope("event", "capabilities", "announce", capabilities(entity)))
-            self.announced_provider = music_provider(entity)
+            logged_in = bool(self.spotify and self.spotify.logged_in)
+            self.send(envelope("event", "capabilities", "announce", capabilities(entity, logged_in)))
+            self.announced_provider = "spotify" if logged_in else music_provider(entity)
             self.send(envelope("event", "time", "snapshot", time_info()))
             self.sync_playback(force=True)
             self.send(envelope("request", "webapp", "list"))
@@ -222,8 +249,8 @@ class GatewaySession:
         if surface == "player":
             self._player(event, body, rid)
             return
-        if surface == "asset" and event == "request":
-            self._asset(body if isinstance(body, dict) else {}, rid)
+        if surface == "asset" and event in ("get", "request", "preload"):
+            self._off_socket(self._asset_message, event, body if isinstance(body, dict) else {}, rid)
             return
         if surface == "net":
             target = self._net
@@ -244,16 +271,25 @@ class GatewaySession:
         if surface == "webapp":
             self._webapp(event, body)
             return
+        if surface == "library":
+            self._library(event, body if isinstance(body, dict) else {}, rid, kind)
+            return
+        if surface == "audio":
+            self._audio(event, body if isinstance(body, dict) else {})
+            return
         if kind == "request":
             self.send(error_response(rid, "unsupported"))
 
     def _player(self, event: str, body: Any, rid: str) -> None:
         if event == "snapshotRequest":
+            self._refresh_spotify()
             self.sync_playback(force=True)
             self.send(envelope("response", "player", "snapshotAck", {}, rid))
             return
-        entity = str(self.state.get("sourceEntity") or "")
         payload = body if isinstance(body, dict) else {}
+        if self._spotify_transport(event, payload):
+            return
+        entity = str(self.state.get("sourceEntity") or "")
         if not entity:
             self._play_failed("no active transport")
             return
@@ -265,6 +301,7 @@ class GatewaySession:
             self.ha.call_service(*service)
         except Exception as exc:  # noqa: BLE001
             self._play_failed(str(exc))
+            return
 
     def _play_failed(self, reason: str) -> None:
         self.send(
@@ -276,13 +313,27 @@ class GatewaySession:
             )
         )
 
-    def _asset(self, body: dict[str, Any], rid: str) -> None:
-        asset_id = str(body.get("id") or "")
+    def _asset_message(self, event: str, body: dict[str, Any], rid: str) -> None:
+        if event == "preload":
+            for asset_id in [str(item) for item in body.get("ids") or [] if item][:64]:
+                if self._fetch_asset(asset_id):
+                    self.send(envelope("event", "asset", "ready", {"id": asset_id}))
+            return
+        self._asset(body, rid)
+
+    def _fetch_asset(self, asset_id: str) -> tuple[bytes, str] | None:
         playback = self.state.get("playback") or {}
         track = playback.get("track") if isinstance(playback, dict) else None
         picture = playback.get("picture") if isinstance(playback, dict) else None
         artwork = track.get("artworkId") if isinstance(track, dict) else None
         fetched = self.ha.fetch_picture(picture) if picture and asset_id == artwork else None
+        if fetched is None and self.spotify is not None:
+            fetched = self.spotify.artwork(asset_id)
+        return fetched
+
+    def _asset(self, body: dict[str, Any], rid: str) -> None:
+        asset_id = str(body.get("id") or "")
+        fetched = self._fetch_asset(asset_id)
         if fetched:
             payload, mime = fetched
             self.send(
@@ -296,6 +347,143 @@ class GatewaySession:
             )
             return
         self.send(envelope("response", "asset", "notFound", {"id": asset_id}, rid))
+
+    def _spotify_transport(self, event: str, payload: dict[str, Any]) -> bool:
+        if self.spotify is None or not self.spotify.logged_in:
+            return False
+        try:
+            handled = self.spotify.command(event, payload)
+        except SpotifyError as exc:
+            self._play_failed(exc.detail or exc.kind)
+            return True
+        if not handled:
+            return False
+        self._refresh_spotify()
+        self.sync_playback(force=True)
+        return True
+
+    def _refresh_spotify(self) -> None:
+        if self.spotify is None or not self.spotify.logged_in:
+            return
+        try:
+            self.state.set_playback(self.spotify.now_playing())
+        except SpotifyError as exc:
+            log.warning("spotify player unavailable: %s", exc.detail or exc.kind)
+
+    def _publish_volume(self, volume: Any) -> None:
+        if not isinstance(volume, dict) or volume == self.sent_volume:
+            return
+        level = volume.get("level")
+        if isinstance(level, bool) or not isinstance(level, (int, float)):
+            return
+        state = {"level": float(level), "muted": bool(volume.get("muted"))}
+        self.sent_volume = state
+        self.send(envelope("event", "audio", "volumeChanged", state))
+
+    def _audio(self, event: str, body: dict[str, Any]) -> None:
+        if self.spotify is not None and self.spotify.logged_in:
+            try:
+                changed = self.spotify.volume_command(event, body)
+            except SpotifyError as exc:
+                log.warning("spotify volume failed: %s", exc.detail or exc.kind)
+                return
+            if changed:
+                self._publish_volume(self.spotify.volume_state())
+            return
+        entity = str(self.state.get("sourceEntity") or "")
+        if not entity:
+            return
+        if event == "volumeUp":
+            service = ("media_player", "volume_up", {"entity_id": entity})
+        elif event == "volumeDown":
+            service = ("media_player", "volume_down", {"entity_id": entity})
+        elif event == "setVolume":
+            service = ("media_player", "volume_set", {"entity_id": entity, "volume_level": float(body.get("level") or 0)})
+        elif event == "setMute":
+            service = ("media_player", "volume_mute", {"entity_id": entity, "is_volume_muted": bool(body.get("muted"))})
+        elif event == "muteToggle":
+            service = ("media_player", "volume_mute", {"entity_id": entity, "is_volume_muted": True})
+        else:
+            return
+        try:
+            self.ha.call_service(*service)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("volume command failed: %s", exc)
+
+    def _library(self, event: str, body: dict[str, Any], rid: str, kind: str) -> None:
+        if self.spotify is None or not self.spotify.logged_in:
+            self._library_error(rid, kind, {"type": "unauthorized"})
+            return
+        try:
+            if event == "browse":
+                result = self.spotify.browse(body)
+                shelves = []
+                for entry in result.get("entries") or []:
+                    data = entry.get("data") if isinstance(entry, dict) and isinstance(entry.get("data"), dict) else {}
+                    kids = data.get("previewChildren")
+                    if isinstance(kids, list):
+                        kinds = [
+                            str((kid.get("data") or {}).get("type") or kid.get("type") or "?")
+                            for kid in kids
+                            if isinstance(kid, dict)
+                        ]
+                        shelves.append(f"{data.get('nodeId')}={len(kids)}[{','.join(kinds)}]")
+                from .protocol import dumps
+
+                encoded_size = len(dumps(envelope("response", "library", "browseReply", {"result": result}, rid)))
+                log.info(
+                    "browse request node=%r limit=%r preview=%r replyBytes=%d shelves=%s",
+                    body.get("nodeId"),
+                    body.get("limit"),
+                    body.get("preview"),
+                    encoded_size,
+                    " ".join(shelves) or f"page={len(result.get('entries') or [])}",
+                )
+                self.send(envelope("response", "library", "browseReply", {"result": result}, rid))
+            elif event == "search":
+                self.send(envelope("response", "library", "searchReply", {"result": self.spotify.search(body)}, rid))
+            elif event == "resolveContext":
+                self.send(envelope("response", "library", "contextResolveReply", self.spotify.resolve(str(body.get("uri") or "")), rid))
+            elif event == "favoritesList":
+                self.send(envelope("response", "library", "favoritesListReply", {"page": self.spotify.favorites(body)}, rid))
+            elif event == "favoritesContains":
+                self.send(envelope("response", "library", "favoritesContainsReply", {"liked": self.spotify.contains(_favorite_uris(body))}, rid))
+            elif event == "recommendations":
+                self._library_error(rid, kind, {"type": "notSupported", "data": {"reason": "recommendations"}})
+            elif event in ("favoritesSet", "favoritesToggle", "favoritesSetMany"):
+                self._favorites_write(event, body)
+            elif kind == "request":
+                self._library_error(rid, kind, {"type": "notSupported", "data": {"reason": event or "unsupported"}})
+        except SpotifyError as exc:
+            log.warning("library %s failed: %s", event or kind, exc.detail or exc.kind)
+            self._library_error(rid, kind, library_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("library %s failed: %s", event or kind, exc)
+            self._library_error(rid, kind, {"type": "notSupported", "data": {"reason": "library failed"}})
+
+    def _favorites_write(self, event: str, body: dict[str, Any]) -> None:
+        assert self.spotify is not None
+        if event == "favoritesSetMany":
+            for entry in body.get("entries") or []:
+                if isinstance(entry, dict):
+                    self._favorites_write("favoritesSet", entry)
+            return
+        item = body.get("item") if isinstance(body.get("item"), dict) else {}
+        uri = str(item.get("uri") or "")
+        if not uri:
+            return
+        if event == "favoritesToggle":
+            liked = not self.spotify.contains([uri])[0]
+        else:
+            liked = bool(body.get("liked"))
+        self.spotify.set_saved(uri, liked)
+        self.send(envelope("event", "library", "favoriteChanged", {"uri": uri, "liked": liked}))
+        self._refresh_spotify()
+        self.sync_playback(force=True)
+
+    def _library_error(self, rid: str, kind: str, error: dict[str, Any]) -> None:
+        if kind == "request" and rid:
+            self.send(envelope("response", "library", "errorReply", {"error": error}, rid))
 
     def _webapp(self, event: str, body: Any) -> None:
         if not isinstance(body, dict):

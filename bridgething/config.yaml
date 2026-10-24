@@ -1,11 +1,11 @@
 name: Bridgething
-version: "0.1.6"
+version: "0.1.49"
 slug: bridgething
 description: >-
   Companion for a Spotify Car Thing running Bridgething. Brings up the USB
   network link, gives the device internet, and exposes the screen as a Home
   Assistant device. Sound stays on a media player you choose.
-url: https://github.com/JoeyEamigh/bridgething
+url: https://github.com/umousesonic/bridgething-homeassistant
 arch:
   - aarch64
   - amd64
