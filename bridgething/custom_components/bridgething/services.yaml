@@ -1,0 +1,69 @@
+set_brightness:
+  name: Set backlight
+  description: Set the Car Thing backlight from 0 to 100. This switches the panel to manual mode.
+  fields:
+    value:
+      name: Level
+      description: 0 is the dimmest and 100 is the brightest.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          mode: slider
+
+set_brightness_mode:
+  name: Set backlight mode
+  description: Auto follows the light sensor. Manual uses the backlight level.
+  fields:
+    mode:
+      name: Mode
+      required: true
+      selector:
+        select:
+          options:
+            - auto
+            - manual
+
+switch_webapp:
+  name: Switch webapp
+  description: Show a webapp full screen. Use an id from the webapp list.
+  fields:
+    webapp_id:
+      name: Webapp
+      required: true
+      selector:
+        text:
+
+navigate:
+  name: Open URL
+  description: Load a URL in the device browser.
+  fields:
+    url:
+      name: URL
+      required: true
+      selector:
+        text:
+
+reboot:
+  name: Reboot
+  description: Restart the Car Thing.
+
+power_off:
+  name: Power off
+  description: Power off the Car Thing.
+
+set_nickname:
+  name: Set nickname
+  description: Set the name the device advertises.
+  fields:
+    nickname:
+      name: Nickname
+      required: true
+      selector:
+        text:
+
+factory_reset:
+  name: Factory reset
+  description: Wipe the data partition and restart the Car Thing.

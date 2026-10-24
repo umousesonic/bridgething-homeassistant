@@ -1,0 +1,98 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Car Thing",
+        "description": "Home Assistant reaches the app through the Docker bridge, usually http://172.30.32.1:8770. The host's loopback will not work.",
+        "data": {
+          "url": "App URL",
+          "source": "Media player"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "The Bridgething app did not answer. Check that the app is started."
+    },
+    "abort": {
+      "already_configured": "This Car Thing is already configured.",
+      "cannot_connect": "The Bridgething app did not answer. It will be tried again when the app starts."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Car Thing",
+        "data": {
+          "url": "App URL",
+          "source": "Media player"
+        },
+        "data_description": {
+          "source": "Sound stays on this media player. Its now-playing state is pushed to the screen."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "The Bridgething app did not answer."
+    }
+  },
+  "services": {
+    "set_brightness": {
+      "name": "Set backlight",
+      "description": "Set the Car Thing backlight from 0 to 100. This switches the panel to manual mode.",
+      "fields": {
+        "value": {
+          "name": "Level",
+          "description": "0 is the dimmest and 100 is the brightest."
+        }
+      }
+    },
+    "set_brightness_mode": {
+      "name": "Set backlight mode",
+      "description": "Auto follows the light sensor. Manual uses the backlight level.",
+      "fields": {
+        "mode": {
+          "name": "Mode"
+        }
+      }
+    },
+    "switch_webapp": {
+      "name": "Switch webapp",
+      "description": "Show a webapp full screen.",
+      "fields": {
+        "webapp_id": {
+          "name": "Webapp"
+        }
+      }
+    },
+    "navigate": {
+      "name": "Open URL",
+      "description": "Load a URL in the device browser.",
+      "fields": {
+        "url": {
+          "name": "URL"
+        }
+      }
+    },
+    "reboot": {
+      "name": "Reboot",
+      "description": "Restart the Car Thing."
+    },
+    "power_off": {
+      "name": "Power off",
+      "description": "Power off the Car Thing."
+    },
+    "set_nickname": {
+      "name": "Set nickname",
+      "description": "Set the name the device advertises.",
+      "fields": {
+        "nickname": {
+          "name": "Nickname"
+        }
+      }
+    },
+    "factory_reset": {
+      "name": "Factory reset",
+      "description": "Wipe the data partition and restart the Car Thing."
+    }
+  }
+}

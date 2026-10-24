@@ -1,0 +1,16 @@
+---
+description: Bump the Bridgething addon version on every project change
+alwaysApply: true
+---
+
+# Bump the version on every change
+
+Every change to this project increments the patch version before the work is finished. `0.1.1` becomes `0.1.2`. Do this once per user request, including docs-only and script-only edits.
+
+Update all of these to the same version:
+
+- `bridgething/config.yaml` `version`
+- `bridgething/custom_components/bridgething/manifest.json` `version`
+- `bridgething/api/version.py` `__version__`
+
+The gateway announce reads `__version__` for `appVersion` and `adapterVersion`. Leave `libVersion` and `libbridgethingVersion` alone; those name the Bridgething library, not this app.
