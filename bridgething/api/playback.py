@@ -171,12 +171,9 @@ def brightness_commands(percent: float) -> list[tuple[str, str, dict[str, Any], 
 
 
 def displayed_brightness(hardware: dict[str, Any] | None) -> float | None:
+    """Last brightness the user set. Auto mode does not move this."""
     brightness = (hardware or {}).get("brightness") or {}
-    mode = brightness.get("mode")
-    if mode == "manual":
-        value = brightness.get("level")
-    else:
-        value = brightness.get("effectiveLevel")
+    value = brightness.get("level")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return round(float(value) * 100, 1)
     return None

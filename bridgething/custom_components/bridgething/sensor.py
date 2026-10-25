@@ -12,6 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .const import current_brightness
 from .coordinator import BridgethingCoordinator
 from .entity import BridgethingEntity
 
@@ -69,11 +70,9 @@ SENSORS = (
     SensorDesc("ambient", "Ambient light", lambda data: _hardware(data).get("ambientLevel"), True, "%", None, SensorStateClass.MEASUREMENT),
     SensorDesc(
         "effective_backlight",
-        "Effective backlight",
-        lambda data: None
-        if (_hardware(data).get("brightness") or {}).get("effectiveLevel") is None
-        else round(float(_hardware(data)["brightness"]["effectiveLevel"]) * 100, 1),
-        False,
+        "Backlight",
+        lambda data: current_brightness(_hardware(data)),
+        True,
         "%",
         None,
         SensorStateClass.MEASUREMENT,

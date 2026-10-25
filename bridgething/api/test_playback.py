@@ -3,7 +3,7 @@ import unittest
 from api.device import DeviceSession
 from api.gateway import GatewaySession
 from api.ha import HomeAssistant
-from api.playback import brightness_commands, player_state_from_ha, transport_service
+from api.playback import brightness_commands, displayed_brightness, player_state_from_ha, transport_service
 from api.server import Companion, route_post
 from api.state import AppState
 
@@ -200,6 +200,10 @@ class BrightnessTests(unittest.TestCase):
         hardware = session.state.get("hardware")
         self.assertEqual(hardware["brightness"]["effectiveLevel"], 0.55)
         self.assertEqual(hardware["ambientLevel"], 30)
+
+    def test_auto_effective_level_does_not_move_the_set_brightness(self) -> None:
+        hardware = {"brightness": {"mode": "auto", "level": 0.2, "effectiveLevel": 0.55}}
+        self.assertEqual(displayed_brightness(hardware), 20)
 
     def test_webapp_list_and_activate_stay_on_the_client_socket(self) -> None:
         session = DeviceSession(AppState())

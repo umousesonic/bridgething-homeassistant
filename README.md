@@ -41,8 +41,9 @@ Open the Bridgething device. These controls are on the main page:
 | --- | --- |
 | **Link** | On when the USB link and the connection to the Car Thing are both up. |
 | **Spotify account** | The Spotify account this companion is logged in as. |
-| **Backlight** | Screen brightness from 0 to 100. |
-| **Backlight mode** | **Auto** follows the room light. **Manual** keeps the slider value. |
+| **Set backlight** | The brightness you set, from 0 to 100. Moving it switches the panel to manual mode. |
+| **Backlight** | The brightness the screen is using now. Auto mode changes this as the room light changes. |
+| **Backlight mode** | **Auto** follows the room light. **Manual** keeps the set backlight value. |
 | **Ambient light** | The light level the Car Thing sees. |
 | **Current app** | The screen that is open. |
 | **Webapp** | Switch the Car Thing to another screen. |

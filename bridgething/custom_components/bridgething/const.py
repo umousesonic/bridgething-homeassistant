@@ -18,13 +18,22 @@ PLATFORMS = [
 ]
 
 
-def displayed_brightness(hardware: dict | None) -> float | None:
-    """Backlight slider value. Auto mode shows the level the panel is actually using."""
-    brightness = (hardware or {}).get("brightness") or {}
-    if brightness.get("mode") == "manual":
-        value = brightness.get("level")
-    else:
-        value = brightness.get("effectiveLevel")
+def _percent(value: object) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return round(float(value) * 100, 1)
     return None
+
+
+def set_brightness(hardware: dict | None) -> float | None:
+    """Last brightness the user set. Auto mode does not move this."""
+    brightness = (hardware or {}).get("brightness") or {}
+    return _percent(brightness.get("level"))
+
+
+def current_brightness(hardware: dict | None) -> float | None:
+    """Brightness the panel is using now."""
+    brightness = (hardware or {}).get("brightness") or {}
+    value = brightness.get("effectiveLevel")
+    if value is None:
+        value = brightness.get("level")
+    return _percent(value)
