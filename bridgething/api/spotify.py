@@ -29,6 +29,8 @@ API_ROOT = "https://api.spotify.com/v1"
 TOKEN_PATH = os.environ.get("BRIDGETHING_SPOTIFY_TOKEN", "/data/spotify.json")
 SKEW_S = 60
 CAPTURE_BACKOFF_S = (30, 60, 120, 300, 600)
+WEB_GAP_S = 0.35
+WEB_RATE_WAIT_S = 8.0
 MAX_ARTWORK = 256 * 1024
 LIKED_COVER = "https://misc.scdn.co/liked-songs/liked-songs-300.jpg"
 WEB_PLAYLIST_TTL_S = 60
@@ -43,10 +45,37 @@ def _looks_canonical_username(name: str) -> bool:
 
 
 class SpotifyError(Exception):
-    def __init__(self, kind: str, detail: str = "") -> None:
+    def __init__(self, kind: str, detail: str = "", retry_after: float | None = None) -> None:
         super().__init__(detail or kind)
         self.kind = kind
         self.detail = detail
+        self.retry_after = retry_after
+
+
+class WebGate:
+    """One Spotify Web API request at a time, with a gap after each one."""
+
+    def __init__(self, interval: float = WEB_GAP_S, clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> None:
+        self.interval = interval
+        self.clock = clock
+        self.sleep = sleep
+        self.lock = threading.Lock()
+        self.next_at = 0.0
+
+    def call(self, func: Callable[[], Any]) -> Any:
+        with self.lock:
+            delay = self.next_at - self.clock()
+            if delay > 0:
+                self.sleep(delay)
+            try:
+                return func()
+            except SpotifyError as exc:
+                penalty = exc.retry_after
+                if isinstance(penalty, (int, float)) and not isinstance(penalty, bool) and penalty > 0:
+                    self.next_at = max(self.next_at, self.clock() + float(penalty))
+                raise
+            finally:
+                self.next_at = max(self.next_at, self.clock() + self.interval)
 
 
 class SpotifySession:
@@ -84,6 +113,7 @@ class SpotifySession:
         self._auth_lock = threading.Lock()
         self._capture_after = 0.0
         self._capture_fails = 0
+        self._web_gate = WebGate()
 
     @property
     def logged_in(self) -> bool:
@@ -1055,12 +1085,31 @@ class SpotifySession:
         return payload
 
     def _read(self, request: urllib.request.Request) -> Any:
+        if self.connect.manual or not _is_spotify_web(request):
+            return self._exchange(request)
+        last: SpotifyError | None = None
+        for _attempt in range(2):
+            try:
+                return self._web_gate.call(lambda: self._exchange(request))
+            except SpotifyError as exc:
+                last = exc
+                if not exc.retry_after:
+                    raise
+                log.info("spotify rate limit, waiting %ss", exc.retry_after)
+        if last is not None:
+            raise last
+        raise SpotifyError("notSupported", "spotify web request failed")
+
+    def _exchange(self, request: urllib.request.Request) -> Any:
         try:
             with self.opener(request, timeout=20) as response:
                 raw = response.read()
                 status = getattr(response, "status", 200)
+                headers = getattr(response, "headers", {})
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:180]
+            if exc.code == 429:
+                raise SpotifyError("notSupported", detail or "429", retry_after=_rate_wait(exc.headers)) from exc
             if exc.code in (401, 403):
                 raise SpotifyError("unauthorized", detail) from exc
             if exc.code == 404:
@@ -1068,6 +1117,8 @@ class SpotifySession:
             raise SpotifyError("notSupported", detail or str(exc.code)) from exc
         except (OSError, urllib.error.URLError) as exc:
             raise SpotifyError("notSupported", str(exc)) from exc
+        if status == 429:
+            raise SpotifyError("notSupported", "429", retry_after=_rate_wait(headers))
         if status >= 400:
             raise SpotifyError("unauthorized" if status in (401, 403) else "notSupported")
         stripped = raw.strip()
@@ -1118,6 +1169,26 @@ class SpotifySession:
             os.chmod(self.path, 0o600)
         except OSError:
             return
+
+
+def _is_spotify_web(request: urllib.request.Request) -> bool:
+    return urllib.parse.urlparse(request.full_url).netloc == "api.spotify.com"
+
+
+def _rate_wait(headers: Any) -> float:
+    raw = ""
+    if hasattr(headers, "get"):
+        found = headers.get("Retry-After")
+        if found is None:
+            found = headers.get("retry-after")
+        raw = str(found or "")
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = 1.0
+    if seconds <= 0:
+        seconds = 1.0
+    return min(seconds, WEB_RATE_WAIT_S)
 
 
 def _expiry(body: dict[str, Any], clock: float) -> float:

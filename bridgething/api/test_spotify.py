@@ -4,6 +4,7 @@ import json
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
@@ -390,6 +391,47 @@ class SpotifyTokenTests(unittest.TestCase):
             self.assertEqual(session.bearer(), "access-1")
             self.assertEqual(calls["n"], 2)
             self.assertGreaterEqual(session._capture_after - time.time(), CAPTURE_BACKOFF_S[-1] - 1)
+
+    def test_web_requests_wait_in_line_and_retry_a_rate_limit(self) -> None:
+        import io
+
+        clock = [0.0]
+        slept: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            slept.append(seconds)
+            clock[0] += seconds
+
+        calls = {"n": 0}
+
+        def opener(request, timeout: float = 20):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "2"},
+                    io.BytesIO(b'{"error":{"status":429,"message":"API rate limit exceeded"}}'),
+                )
+            return _Response({"items": [], "total": 0, "next": None})
+
+        with tempfile.TemporaryDirectory() as directory:
+            session = SpotifySession(str(Path(directory) / "spotify.json"), opener=opener)
+            session.connect.manual = False
+            session._data = {
+                "access_token": "access-1",
+                "expires_at": time.time() + 3600,
+                "username": "canonicaluserid123",
+                "auth_data": base64.b64encode(b"blob").decode("ascii"),
+            }
+            session._web_gate.clock = lambda: clock[0]
+            session._web_gate.sleep = sleep
+            session._page("/me/playlists", 1, 0)
+            session._page("/me/playlists", 1, 0)
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(slept[0], 2.0)
+        self.assertGreaterEqual(slept[-1], 0.35)
 
     def test_stale_home_assistant_login_does_not_replace_a_live_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
