@@ -1,13 +1,14 @@
 """Spotify account for this companion.
 
-The Car Thing never receives the token. Home Assistant logs the user in, and
-this process stores the refresh token. Playback arrives on Spotify's dealer
-socket. The shelf uses the same card shape as 0.1.18 and is filled from
-spclient.
+The Car Thing never receives the token. Home Assistant logs the user in once.
+This process exchanges that access token for Spotify's reusable credential and
+mints later access tokens from it. Playback arrives on Spotify's dealer socket.
+The shelf uses the same card shape as 0.1.18 and is filled from spclient.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -20,13 +21,14 @@ import urllib.request
 from typing import Any, Callable
 
 from .art import LIKED_SONGS_ASSET, art_url
-from .connect import DESKTOP_CLIENT_ID, Connect
+from .connect import DESKTOP_CLIENT_ID, Connect, _ap_login, mint_access_token
 from .connect import SpotifyError as ConnectError
 
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_ROOT = "https://api.spotify.com/v1"
 TOKEN_PATH = os.environ.get("BRIDGETHING_SPOTIFY_TOKEN", "/data/spotify.json")
 SKEW_S = 60
+CAPTURE_BACKOFF_S = (30, 60, 120, 300, 600)
 MAX_ARTWORK = 256 * 1024
 LIKED_COVER = "https://misc.scdn.co/liked-songs/liked-songs-300.jpg"
 WEB_PLAYLIST_TTL_S = 60
@@ -79,61 +81,67 @@ class SpotifySession:
             self._save()
         self.connect.device_id = str(self._data.get("connect_device_id") or "")
         self.connect.on_identity = self._remember_identity
+        self._auth_lock = threading.Lock()
+        self._capture_after = 0.0
+        self._capture_fails = 0
 
     @property
     def logged_in(self) -> bool:
         with self.lock:
-            return bool(self._data.get("refresh_token") or self._data.get("access_token"))
+            return self._signed_in_locked()
 
     def status(self) -> dict[str, Any]:
         with self.lock:
             return {
-                "loggedIn": bool(self._data.get("refresh_token") or self._data.get("access_token")),
+                "loggedIn": self._signed_in_locked(),
                 "username": self._data.get("username"),
             }
 
     def adopt(self, body: dict[str, Any], now: float | None = None) -> dict[str, Any]:
+        clock = time.time() if now is None else now
         with self.lock:
-            for key in ("access_token", "refresh_token"):
-                value = body.get(key)
-                if isinstance(value, str) and value:
-                    self._data[key] = value
             self._data["client_id"] = DESKTOP_CLIENT_ID
             self._data.pop("client_secret", None)
-            expires_at = body.get("expires_at")
-            expires_in = body.get("expires_in")
-            clock = time.time() if now is None else now
-            if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
-                self._data["expires_at"] = float(expires_at)
-            elif isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
-                self._data["expires_at"] = clock + float(expires_in)
+            incoming_access = body.get("access_token") if isinstance(body.get("access_token"), str) else ""
+            incoming_refresh = body.get("refresh_token") if isinstance(body.get("refresh_token"), str) else ""
+            incoming_expires = _expiry(body, clock)
+            stored_refresh = self._data.get("refresh_token") if isinstance(self._data.get("refresh_token"), str) else ""
+            fresh_login = bool(incoming_refresh) and incoming_refresh != stored_refresh and incoming_expires > clock
+            current_expires = float(self._data.get("expires_at") or 0)
+            if incoming_access and (not self._data.get("access_token") or incoming_expires >= current_expires):
+                self._data["access_token"] = incoming_access
+                if incoming_expires:
+                    self._data["expires_at"] = incoming_expires
+            if incoming_refresh and (not stored_refresh or fresh_login):
+                self._data["refresh_token"] = incoming_refresh
+            if fresh_login:
+                self._data.pop("auth_data", None)
+                self._data.pop("auth_type", None)
             username = body.get("username")
             if isinstance(username, str) and _looks_canonical_username(username):
                 self._data["username"] = username
                 self.connect.username = username
             self._save()
+            access = self._data.get("access_token")
+            expires = float(self._data.get("expires_at") or 0)
+        if isinstance(access, str) and access and clock + SKEW_S < expires and not self._has_stored() and clock >= self._capture_after:
+            with self._auth_lock:
+                if not self._has_stored() and clock >= self._capture_after:
+                    self._capture(access)
         return self.status()
 
     def bearer(self, now: float | None = None) -> str | None:
         clock = time.time() if now is None else now
-        with self.lock:
-            access = self._data.get("access_token")
-            expires = float(self._data.get("expires_at") or 0)
-            refresh = self._data.get("refresh_token")
-        if isinstance(access, str) and access and clock + SKEW_S < expires:
+        access = self._fresh(clock)
+        if access and (self._has_stored() or self.connect.manual or clock < self._capture_after):
             return access
-        if not isinstance(refresh, str) or not refresh:
-            return access if isinstance(access, str) and access else None
-        payload = self._token(
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": refresh,
-                "client_id": DESKTOP_CLIENT_ID,
-            }
-        )
-        self._store_token(payload, refresh, clock)
-        stored = self._data.get("access_token")
-        return stored if isinstance(stored, str) else None
+        with self._auth_lock:
+            access = self._fresh(clock)
+            if access is None:
+                access = self._renew(clock)
+            if access and not self._has_stored() and clock >= self._capture_after:
+                self._capture(access)
+            return access
 
     def browse(self, body: dict[str, Any]) -> dict[str, Any]:
         """Library browse using the official Bridgething Spotify provider's shelf rules."""
@@ -904,6 +912,136 @@ class SpotifySession:
             if changed:
                 self._save()
 
+    def _signed_in_locked(self) -> bool:
+        return bool(self._data.get("refresh_token") or self._data.get("access_token") or self._data.get("auth_data"))
+
+    def _fresh(self, clock: float) -> str | None:
+        with self.lock:
+            access = self._data.get("access_token")
+            expires = float(self._data.get("expires_at") or 0)
+        if isinstance(access, str) and access and clock + SKEW_S < expires:
+            return access
+        return None
+
+    def _has_stored(self) -> bool:
+        with self.lock:
+            return bool(self._blob_locked())
+
+    def _blob_locked(self) -> bytes:
+        raw = self._data.get("auth_data")
+        if not isinstance(raw, str) or not raw:
+            return b""
+        try:
+            return base64.b64decode(raw)
+        except (ValueError, TypeError):
+            return b""
+
+    def _device_id(self) -> str:
+        if self.connect.device_id:
+            return self.connect.device_id
+        with self.lock:
+            stored = self._data.get("connect_device_id")
+            if isinstance(stored, str) and stored:
+                self.connect.device_id = stored
+                return stored
+        self.connect.device_id = os.urandom(20).hex()
+        self._remember_identity()
+        return self.connect.device_id
+
+    def _renew(self, clock: float) -> str | None:
+        with self.lock:
+            blob = self._blob_locked()
+            username = self._data.get("username") if isinstance(self._data.get("username"), str) else ""
+            refresh = self._data.get("refresh_token")
+            access = self._data.get("access_token")
+        if blob and username and not self.connect.manual:
+            try:
+                minted = mint_access_token(
+                    self.opener,
+                    self.connect._client_header(),
+                    self._device_id(),
+                    username,
+                    blob,
+                )
+            except (SpotifyError, ConnectError) as exc:
+                log.warning("spotify stored login failed: %s", exc.detail or exc.kind)
+                if exc.kind == "unauthorized":
+                    self._drop_stored()
+            else:
+                self._store_minted(minted, clock)
+                token = minted.get("access_token")
+                return token if isinstance(token, str) else None
+        if not isinstance(refresh, str) or not refresh:
+            return access if isinstance(access, str) and access else None
+        payload = self._token(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+                "client_id": DESKTOP_CLIENT_ID,
+            }
+        )
+        self._store_token(payload, refresh, clock)
+        stored = self._data.get("access_token")
+        return stored if isinstance(stored, str) else None
+
+    def _capture(self, access: str) -> None:
+        if self.connect.manual or self._has_stored() or time.time() < self._capture_after:
+            return
+        try:
+            found = _ap_login(self.opener, access, self._device_id())
+        except (SpotifyError, ConnectError, OSError) as exc:
+            detail = getattr(exc, "detail", None) or str(exc)
+            self._defer_capture(detail)
+            return
+        blob = found.get("auth_data") or b""
+        if not isinstance(blob, (bytes, bytearray)) or not blob:
+            self._defer_capture("spotify access point login did not return a reusable credential")
+            return
+        self._capture_fails = 0
+        self._capture_after = 0.0
+        with self.lock:
+            self._data["auth_data"] = base64.b64encode(bytes(blob)).decode("ascii")
+            auth_type = found.get("auth_type")
+            if isinstance(auth_type, int):
+                self._data["auth_type"] = auth_type
+            username = found.get("username")
+            if isinstance(username, str) and username:
+                self._data["username"] = username
+                self.connect.username = username
+            self._save()
+
+    def _defer_capture(self, detail: str) -> None:
+        self._capture_fails += 1
+        step = CAPTURE_BACKOFF_S[min(self._capture_fails - 1, len(CAPTURE_BACKOFF_S) - 1)]
+        self._capture_after = time.time() + step
+        log.warning("spotify reusable login unavailable: %s; retrying in %ss", detail, step)
+
+    def _store_minted(self, minted: dict[str, Any], now: float) -> None:
+        with self.lock:
+            access = minted.get("access_token")
+            if isinstance(access, str) and access:
+                self._data["access_token"] = access
+            expires_in = minted.get("expires_in")
+            if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
+                self._data["expires_at"] = now + float(expires_in)
+            blob = minted.get("auth_data")
+            if isinstance(blob, (bytes, bytearray)) and blob:
+                self._data["auth_data"] = base64.b64encode(bytes(blob)).decode("ascii")
+            username = minted.get("username")
+            if isinstance(username, str) and username:
+                self._data["username"] = username
+                self.connect.username = username
+            self._data["client_id"] = DESKTOP_CLIENT_ID
+            self._save()
+
+    def _drop_stored(self) -> None:
+        with self.lock:
+            if "auth_data" not in self._data and "auth_type" not in self._data:
+                return
+            self._data.pop("auth_data", None)
+            self._data.pop("auth_type", None)
+            self._save()
+
     def _token(self, fields: dict[str, str]) -> dict[str, Any]:
         request = urllib.request.Request(
             TOKEN_URL,
@@ -980,6 +1118,16 @@ class SpotifySession:
             os.chmod(self.path, 0o600)
         except OSError:
             return
+
+
+def _expiry(body: dict[str, Any], clock: float) -> float:
+    expires_at = body.get("expires_at")
+    expires_in = body.get("expires_in")
+    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+        return float(expires_at)
+    if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
+        return clock + float(expires_in)
+    return 0.0
 
 
 def _limit(value: Any, default: int) -> int:

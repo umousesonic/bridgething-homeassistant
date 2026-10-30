@@ -84,7 +84,7 @@ class BridgethingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return result
 
     async def async_push_spotify(self) -> None:
-        """Give the companion the Spotify login. The companion refreshes it, and the Car Thing never sees it."""
+        """Give the companion the Spotify login. It keeps Spotify's reusable credential, and the Car Thing never sees it."""
         token = self.entry.data.get("token")
         if not isinstance(token, dict) or not token.get("access_token"):
             return

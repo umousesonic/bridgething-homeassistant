@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import tempfile
 import time
@@ -6,15 +8,15 @@ import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
-from api.connect import DESKTOP_CLIENT_ID
+from api.connect import DESKTOP_CLIENT_ID, SpotifyError as ConnectError, _read_welcome, _solve_login5_hashcash, _trailing_zeros
 from api.gateway import GatewaySession
 from api.ha import HomeAssistant
-from api.pb import Keep, encode
+from api.pb import Keep, decode, encode, message
 from api.server import Companion, route_post
 from api.shannon import Shannon
 from api.art import THUMB_EDGE, with_edge
 from api.protocol import as_bytes, decode_frames, encode_json
-from api.spotify import SpotifySession, _track
+from api.spotify import CAPTURE_BACKOFF_S, SpotifySession, _track
 from api.state import AppState
 
 TRACK_URI = "spotify:track:abc"
@@ -288,6 +290,130 @@ class SpotifyTokenTests(unittest.TestCase):
             self.assertIn(f"client_id={DESKTOP_CLIENT_ID}", seen["body"])
             self.assertNotIn("client_secret", seen["body"])
 
+    def test_welcome_keeps_the_reusable_credential(self) -> None:
+        payload = encode([(0x0A, "canonicaluserid123"), (0x1E, 1), (0x28, b"reusable")])
+        found = _read_welcome(payload)
+        self.assertEqual(found["username"], "canonicaluserid123")
+        self.assertEqual(found["auth_data"], b"reusable")
+        self.assertEqual(found["auth_type"], 1)
+
+    def test_login5_hashcash_meets_the_requested_width(self) -> None:
+        suffix, elapsed = _solve_login5_hashcash(b"context", b"prefix", 8)
+        check = int.from_bytes(hashlib.sha1(b"prefix" + suffix).digest()[12:20], "big", signed=True)
+        self.assertGreaterEqual(_trailing_zeros(check), 8)
+        self.assertGreaterEqual(elapsed, 0)
+
+    def test_stored_credential_mints_an_access_token_without_the_refresh_grant(self) -> None:
+        seen: list[bytes] = []
+
+        def opener(request, timeout: float = 20):
+            url = request.full_url
+            if "clienttoken.spotify.com" in url:
+                return _Raw(encode([(1, 1), (2, [(1, "client-tok"), (3, 7200)])]))
+            if "login5.spotify.com" in url:
+                seen.append(request.data)
+                self.assertEqual(request.get_header("Client-token"), "client-tok")
+                return _Raw(encode([(1, [(1, "canonicaluserid123"), (2, "access-from-blob"), (3, b"new-blob"), (4, 3600)])]))
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as directory:
+            session = SpotifySession(str(Path(directory) / "spotify.json"), opener=opener)
+            session.connect.manual = False
+            session.connect.device_id = "device-1"
+            session.connect.username = "canonicaluserid123"
+            session._data = {
+                "access_token": "expired",
+                "refresh_token": "refresh-original",
+                "expires_at": time.time() - 10,
+                "username": "canonicaluserid123",
+                "auth_data": base64.b64encode(b"stored-blob").decode("ascii"),
+                "connect_device_id": "device-1",
+            }
+            self.assertEqual(session.bearer(), "access-from-blob")
+            saved = json.loads(Path(session.path).read_text(encoding="utf-8"))
+            self.assertEqual(saved["refresh_token"], "refresh-original")
+            self.assertEqual(saved["access_token"], "access-from-blob")
+            self.assertEqual(base64.b64decode(saved["auth_data"]), b"new-blob")
+            stored = message(next(value for field, _wire, value in decode(seen[0]) if field == 100), {1: ("username", "string"), 2: ("data", "bytes")})
+            self.assertEqual(stored["username"], "canonicaluserid123")
+            self.assertEqual(stored["data"], b"stored-blob")
+
+    def test_rejected_stored_login_falls_back_to_the_refresh_token(self) -> None:
+        def opener(request, timeout: float = 20):
+            url = request.full_url
+            if "clienttoken.spotify.com" in url:
+                return _Raw(encode([(1, 1), (2, [(1, "client-tok"), (3, 7200)])]))
+            if "login5.spotify.com" in url:
+                return _Raw(encode([(2, 1)]))
+            if "/api/token" in url:
+                return _Response({"access_token": "access-from-refresh", "expires_in": 3600})
+            if "apresolve" in url:
+                return _Response({"accesspoint": []})
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as directory:
+            session = SpotifySession(str(Path(directory) / "spotify.json"), opener=opener)
+            session.connect.manual = False
+            session.connect.device_id = "device-1"
+            session._data = {
+                "access_token": "expired",
+                "refresh_token": "refresh-1",
+                "expires_at": time.time() - 10,
+                "username": "canonicaluserid123",
+                "auth_data": base64.b64encode(b"stored-blob").decode("ascii"),
+                "connect_device_id": "device-1",
+            }
+            self.assertEqual(session.bearer(), "access-from-refresh")
+            saved = json.loads(Path(session.path).read_text(encoding="utf-8"))
+            self.assertNotIn("auth_data", saved)
+            self.assertEqual(saved["refresh_token"], "refresh-1")
+
+    def test_reusable_login_backs_off_after_a_failure(self) -> None:
+        calls = {"n": 0}
+
+        def opener(request, timeout: float = 20):
+            if "apresolve.spotify.com" in request.full_url:
+                calls["n"] += 1
+                raise ConnectionRefusedError(111, "Connection refused")
+            raise AssertionError(request.full_url)
+
+        with tempfile.TemporaryDirectory() as directory:
+            session = SpotifySession(str(Path(directory) / "spotify.json"), opener=opener)
+            session.connect.manual = False
+            session._data = {"access_token": "access-1", "expires_at": time.time() + 3600}
+            self.assertEqual(session.bearer(), "access-1")
+            self.assertEqual(session.bearer(), "access-1")
+            self.assertEqual(calls["n"], 1)
+            self.assertGreater(session._capture_after, time.time())
+            session._capture_fails = len(CAPTURE_BACKOFF_S)
+            session._capture_after = time.time() - 1
+            self.assertEqual(session.bearer(), "access-1")
+            self.assertEqual(calls["n"], 2)
+            self.assertGreaterEqual(session._capture_after - time.time(), CAPTURE_BACKOFF_S[-1] - 1)
+
+    def test_stale_home_assistant_login_does_not_replace_a_live_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = SpotifySession(str(Path(directory) / "spotify.json"), opener=lambda request, timeout=20: (_ for _ in ()).throw(AssertionError(request.full_url)))
+            session._data = {
+                "access_token": "live",
+                "refresh_token": "refresh-rotated",
+                "expires_at": time.time() + 1800,
+                "username": "canonicaluserid123",
+                "auth_data": base64.b64encode(b"reusable").decode("ascii"),
+            }
+            session.connect.username = "canonicaluserid123"
+            session.adopt(
+                {
+                    "access_token": "stale",
+                    "refresh_token": "refresh-original",
+                    "expires_at": time.time() - 10,
+                }
+            )
+            saved = json.loads(Path(session.path).read_text(encoding="utf-8"))
+            self.assertEqual(saved["access_token"], "live")
+            self.assertEqual(saved["refresh_token"], "refresh-rotated")
+            self.assertEqual(base64.b64decode(saved["auth_data"]), b"reusable")
+
     def test_credentials_route_hides_the_token_from_home_assistant_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             session = SpotifySession(str(Path(directory) / "spotify.json"), opener=lambda request, timeout=20: (_ for _ in ()).throw(AssertionError(request.full_url)))
@@ -327,8 +453,9 @@ class SpotifyTokenTests(unittest.TestCase):
             self.assertIsNone(session.status()["username"])
             self.assertEqual(session.connect.username, "")
             session.connect.manual = False
-            with patch("api.connect._ap_username", return_value="canonical-user-id"):
-                session.connect._username()
+            with patch("api.spotify._ap_login", side_effect=ConnectError("notSupported", "no access point")):
+                with patch("api.connect._ap_username", return_value="canonical-user-id"):
+                    session.connect._username()
             self.assertEqual(session.connect.username, "canonical-user-id")
             self.assertEqual(session.status()["username"], "canonical-user-id")
             saved = json.loads(path.read_text(encoding="utf-8"))

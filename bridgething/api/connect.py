@@ -1319,11 +1319,27 @@ def _resolve(opener: Opener, kind: str) -> str:
 
 
 def _ap_username(opener: Opener, token: str, device_id: str) -> str:
-    hostport = _resolve_accesspoint(opener)
-    host, port = hostport
-    sock = socket.create_connection((host, port), timeout=10)
+    return str(_ap_login(opener, token, device_id)["username"])
+
+
+def _ap_login(
+    opener: Opener,
+    token: str,
+    device_id: str,
+    username: str = "",
+    auth_data: bytes = b"",
+    auth_type: int = 3,
+) -> dict[str, Any]:
+    """Log in at the access point and keep the reusable credential from the welcome."""
     try:
-        return _ap_handshake(sock, token, device_id)
+        host, port = _resolve_accesspoint(opener)
+        sock = socket.create_connection((host, port), timeout=10)
+    except SpotifyError:
+        raise
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, UnicodeError) as exc:
+        raise SpotifyError("notSupported", str(exc)) from exc
+    try:
+        return _ap_handshake(sock, token, device_id, username, auth_data, auth_type)
     finally:
         sock.close()
 
@@ -1339,7 +1355,14 @@ def _resolve_accesspoint(opener: Opener) -> tuple[str, int]:
     return host, int(port)
 
 
-def _ap_handshake(sock: socket.socket, token: str, device_id: str) -> str:
+def _ap_handshake(
+    sock: socket.socket,
+    token: str,
+    device_id: str,
+    username: str = "",
+    auth_data: bytes = b"",
+    auth_type: int = 3,
+) -> dict[str, Any]:
     private = int.from_bytes(os.urandom(95), "little")
     public = pow(2, private, _DH_PRIME).to_bytes((pow(2, private, _DH_PRIME).bit_length() + 7) // 8, "big")
     hello = encode([
@@ -1374,20 +1397,188 @@ def _ap_handshake(sock: socket.socket, token: str, device_id: str) -> str:
     sock.sendall(packet)
     send = Shannon(send_key)
     recv = Shannon(recv_key)
+    material = auth_data if auth_data else token.encode("utf-8")
+    credentials: list[tuple[int, Any]] = [(0x14, Keep(auth_type)), (0x1E, material)]
+    if username:
+        credentials.insert(0, (0x0A, username))
     login = encode([
-        (0x0A, [(0x14, Keep(3)), (0x1E, token.encode("utf-8"))]),
+        (0x0A, credentials),
         (0x32, [(0x0A, Keep(2)), (0x3C, Keep(5)), (0x5A, "bridgething-sfp"), (0x64, device_id)]),
         (0x46, "bridgething-sfp 0.1"),
     ])
     _send_packet(sock, send, 0xAB, login)
     command, payload = _recv_packet(sock, recv)
     if command == 0xAC:
-        welcome = message(payload, {0x0A: ("canonical_username", "string")})
-        name = welcome.get("canonical_username")
-        if not isinstance(name, str) or not name:
-            raise SpotifyError("unauthorized", "spotify did not return a username")
-        return name
+        return _read_welcome(payload)
     raise SpotifyError("unauthorized", f"spotify access point rejected the token ({command:#x})")
+
+
+def _read_welcome(payload: bytes) -> dict[str, Any]:
+    """Username plus the reusable credential Spotify expects the client to keep."""
+    welcome = message(
+        payload,
+        {
+            0x0A: ("canonical_username", "string"),
+            0x1E: ("reusable_auth_credentials_type", "varint"),
+            0x28: ("reusable_auth_credentials", "bytes"),
+        },
+    )
+    name = welcome.get("canonical_username")
+    if not isinstance(name, str) or not name:
+        raise SpotifyError("unauthorized", "spotify did not return a username")
+    blob = welcome.get("reusable_auth_credentials") or b""
+    kind = welcome.get("reusable_auth_credentials_type")
+    return {
+        "username": name,
+        "auth_data": bytes(blob) if isinstance(blob, (bytes, bytearray)) else b"",
+        "auth_type": kind if isinstance(kind, int) else 1,
+    }
+
+
+_LOGIN5_OK = {
+    1: ("username", "string"),
+    2: ("access_token", "string"),
+    3: ("stored_credential", "bytes"),
+    4: ("expires_in", "varint"),
+}
+_LOGIN5_RESPONSE = {
+    1: ("ok", "message", _LOGIN5_OK),
+    2: ("error", "varint"),
+    3: (
+        "challenges",
+        "message",
+        {
+            1: (
+                "challenge",
+                "repeat-message",
+                {1: ("hashcash", "message", {1: ("prefix", "bytes"), 2: ("length", "varint")}), 2: ("code", "message", {})},
+            )
+        },
+    ),
+    5: ("login_context", "bytes"),
+}
+_LOGIN5_URL = "https://login5.spotify.com/v3/login"
+
+
+def mint_access_token(opener: Opener, client_token: str, device_id: str, username: str, auth_data: bytes) -> dict[str, Any]:
+    """Mint a Web API access token from the reusable credential. The OAuth refresh token is not used."""
+    if not client_token:
+        raise SpotifyError("notSupported", "spotify client token unavailable")
+    if not username or not auth_data:
+        raise SpotifyError("unauthorized", "spotify reusable login is missing")
+    context = b""
+    solutions: list[Any] | None = None
+    for _ in range(3):
+        fields: list[tuple[int, Any]] = [
+            (1, [(1, DESKTOP_CLIENT_ID), (2, device_id)]),
+            (100, [(1, username), (2, auth_data)]),
+        ]
+        if context:
+            fields.append((2, context))
+        if solutions:
+            fields.append((3, [(1, solutions)]))
+        parsed = _login5_call(opener, client_token, encode(fields))
+        ok = parsed.get("ok") if isinstance(parsed.get("ok"), dict) else {}
+        token = ok.get("access_token")
+        if isinstance(token, str) and token:
+            blob = ok.get("stored_credential")
+            expires = ok.get("expires_in")
+            return {
+                "username": ok.get("username") or username,
+                "access_token": token,
+                "auth_data": bytes(blob) if isinstance(blob, (bytes, bytearray)) and blob else auth_data,
+                "expires_in": int(expires) if isinstance(expires, int) and expires > 0 else 3600,
+            }
+        error = parsed.get("error")
+        if isinstance(error, int) and not ok:
+            if error in (1, 2, 5):
+                raise SpotifyError("unauthorized", f"spotify stored login was rejected ({error})")
+            raise SpotifyError("notSupported", f"spotify stored login failed ({error})")
+        challenges = (parsed.get("challenges") or {}).get("challenge") or []
+        raw_context = parsed.get("login_context") or b""
+        context = bytes(raw_context) if isinstance(raw_context, (bytes, bytearray)) else b""
+        solutions = _login5_solutions(challenges, context)
+    raise SpotifyError("notSupported", "spotify stored login was not solved")
+
+
+def _login5_solutions(challenges: list[Any], context: bytes) -> list[Any]:
+    solutions = []
+    for challenge in challenges:
+        if not isinstance(challenge, dict):
+            continue
+        if challenge.get("code") and not challenge.get("hashcash"):
+            raise SpotifyError("notSupported", "spotify asked for a code challenge")
+        cash = challenge.get("hashcash")
+        if not isinstance(cash, dict):
+            continue
+        prefix = cash.get("prefix") or b""
+        if not isinstance(prefix, (bytes, bytearray)):
+            prefix = b""
+        suffix, elapsed = _solve_login5_hashcash(context, bytes(prefix), int(cash.get("length") or 0))
+        solutions.append([(1, [(1, suffix), (2, [(1, elapsed)])])])
+    if not solutions:
+        raise SpotifyError("notSupported", "spotify stored login returned no token")
+    return solutions
+
+
+def _login5_call(opener: Opener, client_token: str, body: bytes) -> dict[str, Any]:
+    request = urllib.request.Request(
+        _LOGIN5_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Accept": "application/x-protobuf",
+            "Content-Type": "application/x-protobuf",
+            "client-token": client_token,
+        },
+    )
+    try:
+        with opener(request, timeout=20) as response:
+            payload = _ungzip(response.read(), getattr(response, "headers", {}))
+    except urllib.error.HTTPError as exc:
+        payload = _ungzip(exc.read(), {})
+        if not payload:
+            detail = "spotify stored login failed"
+            raise SpotifyError("unauthorized" if exc.code in (401, 403) else "notSupported", detail) from exc
+    except (OSError, urllib.error.URLError) as exc:
+        raise SpotifyError("notSupported", str(exc)) from exc
+    try:
+        return message(payload, _LOGIN5_RESPONSE)
+    except ValueError as exc:
+        raise SpotifyError("notSupported", "spotify stored login response was not a protobuf") from exc
+
+
+def _solve_login5_hashcash(context: bytes, prefix: bytes, length: int) -> tuple[bytes, int]:
+    """Same hashcash login5 uses: SHA1(prefix + suffix) trailing zeros, suffix derived from the context."""
+    width = max(0, min(int(length), 32))
+    target = int.from_bytes(hashlib.sha1(context).digest()[12:20], "big", signed=True)
+    started = time.perf_counter()
+    counter = 0
+    while time.perf_counter() - started < 5:
+        suffix = _i64(target + counter).to_bytes(8, "big", signed=True) + _i64(counter).to_bytes(8, "big", signed=True)
+        check = int.from_bytes(hashlib.sha1(prefix + suffix).digest()[12:20], "big", signed=True)
+        if _trailing_zeros(check) >= width:
+            return suffix, max(0, int(time.perf_counter() - started))
+        counter += 1
+    raise SpotifyError("notSupported", "spotify login challenge was not solved")
+
+
+def _i64(value: int) -> int:
+    value %= 1 << 64
+    if value >= 1 << 63:
+        value -= 1 << 64
+    return value
+
+
+def _trailing_zeros(value: int) -> int:
+    bits = value & ((1 << 64) - 1)
+    if bits == 0:
+        return 64
+    count = 0
+    while bits & 1 == 0:
+        bits >>= 1
+        count += 1
+    return count
 
 
 def _send_packet(sock: socket.socket, cipher: Shannon, command: int, payload: bytes) -> None:
