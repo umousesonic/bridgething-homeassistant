@@ -1379,10 +1379,9 @@ def _ap_handshake(
     length = int.from_bytes(_read_exact(sock, 4), "big")
     body = _read_exact(sock, length - 4)
     acc += length.to_bytes(4, "big") + body
-    challenge = message(body, {0x0A: ("challenge", "message", {0x0A: ("diffie_hellman", "message", {0x0A: ("gs", "bytes"), 0x1E: ("gs_signature", "bytes")})})})
-    diffie = ((challenge.get("challenge") or {}).get("diffie_hellman")) or {}
-    remote = diffie.get("gs") or b""
-    signature = diffie.get("gs_signature") or b""
+    remote, signature = _access_point_keys(body)
+    if not remote or not signature:
+        raise SpotifyError("unauthorized", "spotify access point did not send a signature")
     if not _verify_server(remote, signature):
         raise SpotifyError("unauthorized", "spotify access point signature did not match")
     shared = pow(int.from_bytes(remote, "big"), private, _DH_PRIME)
@@ -1609,6 +1608,35 @@ def _keys(shared: bytes, packets: bytes) -> tuple[bytes, bytes, bytes]:
         folded += digest
     challenge = hmac.new(folded[:0x14], packets, hashlib.sha1).digest()
     return challenge, bytes(folded[0x14:0x34]), bytes(folded[0x34:0x54])
+
+
+def _access_point_keys(payload: bytes) -> tuple[bytes, bytes]:
+    """Server public key and signature from the access-point challenge.
+
+    The key sits inside the Diffie-Hellman message, which is inside the login
+    crypto union, which is inside the challenge.
+    """
+    diffie = {
+        0x0A: ("gs", "bytes"),
+        0x1E: ("gs_signature", "bytes"),
+    }
+    parsed = message(
+        payload,
+        {
+            0x0A: (
+                "challenge",
+                "message",
+                {0x0A: ("login_crypto", "message", {0x0A: ("diffie_hellman", "message", diffie)})},
+            )
+        },
+    )
+    found = (((parsed.get("challenge") or {}).get("login_crypto") or {}).get("diffie_hellman")) or {}
+    remote = found.get("gs") or b""
+    signature = found.get("gs_signature") or b""
+    return (
+        bytes(remote) if isinstance(remote, (bytes, bytearray)) else b"",
+        bytes(signature) if isinstance(signature, (bytes, bytearray)) else b"",
+    )
 
 
 def _verify_server(remote: bytes, signature: bytes) -> bool:

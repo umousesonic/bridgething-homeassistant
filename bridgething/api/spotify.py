@@ -30,7 +30,7 @@ TOKEN_PATH = os.environ.get("BRIDGETHING_SPOTIFY_TOKEN", "/data/spotify.json")
 SKEW_S = 60
 CAPTURE_BACKOFF_S = (30, 60, 120, 300, 600)
 WEB_GAP_S = 0.35
-WEB_RATE_WAIT_S = 8.0
+WEB_RATE_WAIT_S = 60.0
 MAX_ARTWORK = 256 * 1024
 LIKED_COVER = "https://misc.scdn.co/liked-songs/liked-songs-300.jpg"
 WEB_PLAYLIST_TTL_S = 60
@@ -61,10 +61,17 @@ class WebGate:
         self.sleep = sleep
         self.lock = threading.Lock()
         self.next_at = 0.0
+        self.quiet_until = 0.0
+
+    def quiet(self) -> bool:
+        return self.clock() < self.quiet_until
 
     def call(self, func: Callable[[], Any]) -> Any:
         with self.lock:
-            delay = self.next_at - self.clock()
+            now = self.clock()
+            if now < self.quiet_until:
+                raise SpotifyError("notSupported", "429", retry_after=self.quiet_until - now)
+            delay = self.next_at - now
             if delay > 0:
                 self.sleep(delay)
             try:
@@ -72,7 +79,7 @@ class WebGate:
             except SpotifyError as exc:
                 penalty = exc.retry_after
                 if isinstance(penalty, (int, float)) and not isinstance(penalty, bool) and penalty > 0:
-                    self.next_at = max(self.next_at, self.clock() + float(penalty))
+                    self.quiet_until = max(self.quiet_until, self.clock() + float(penalty))
                 raise
             finally:
                 self.next_at = max(self.next_at, self.clock() + self.interval)
@@ -622,7 +629,10 @@ class SpotifySession:
         except SpotifyError as exc:
             log.warning("rootlist failed: %s", exc.detail or exc.kind)
         seen = {_playlist_key(str(item.get("uri") or "")) for item in listed if isinstance(item, dict)}
-        for item in self._playback_playlist_seeds() + self._web_playlist_seeds():
+        extra = self._playback_playlist_seeds()
+        if not any(_spotify_id(str(item.get("uri") or ""))[0] == "playlist" for item in listed if isinstance(item, dict)):
+            extra.extend(self._web_playlist_seeds())
+        for item in extra:
             uri = str(item.get("uri") or "")
             key = _playlist_key(uri)
             if uri and key not in seen:
@@ -638,7 +648,7 @@ class SpotifySession:
     def _web_playlist_seeds(self) -> list[dict[str, Any]]:
         """Token-scoped Web API list. Fills the shelf when rootlist is empty."""
         now = time.time()
-        if self._web_playlists and now - self._web_playlists_at < WEB_PLAYLIST_TTL_S:
+        if self._web_gate.quiet() or (self._web_playlists and now - self._web_playlists_at < WEB_PLAYLIST_TTL_S):
             return list(self._web_playlists)
         seeds: list[dict[str, Any]] = []
         offset = 0
@@ -646,7 +656,10 @@ class SpotifySession:
             try:
                 page = self._page("/me/playlists", 50, offset)
             except SpotifyError as exc:
-                log.warning("web playlist list failed: %s", exc.detail or exc.kind)
+                if exc.retry_after:
+                    log.info("spotify playlist list is rate limited for %ss", round(exc.retry_after))
+                else:
+                    log.warning("web playlist list failed: %s", exc.detail or exc.kind)
                 break
             for item in page["items"]:
                 uri = str(item.get("uri") or "")
@@ -1087,18 +1100,7 @@ class SpotifySession:
     def _read(self, request: urllib.request.Request) -> Any:
         if self.connect.manual or not _is_spotify_web(request):
             return self._exchange(request)
-        last: SpotifyError | None = None
-        for _attempt in range(2):
-            try:
-                return self._web_gate.call(lambda: self._exchange(request))
-            except SpotifyError as exc:
-                last = exc
-                if not exc.retry_after:
-                    raise
-                log.info("spotify rate limit, waiting %ss", exc.retry_after)
-        if last is not None:
-            raise last
-        raise SpotifyError("notSupported", "spotify web request failed")
+        return self._web_gate.call(lambda: self._exchange(request))
 
     def _exchange(self, request: urllib.request.Request) -> Any:
         try:
@@ -1185,9 +1187,9 @@ def _rate_wait(headers: Any) -> float:
     try:
         seconds = float(raw)
     except ValueError:
-        seconds = 1.0
+        seconds = 30.0
     if seconds <= 0:
-        seconds = 1.0
+        seconds = 30.0
     return min(seconds, WEB_RATE_WAIT_S)
 
 

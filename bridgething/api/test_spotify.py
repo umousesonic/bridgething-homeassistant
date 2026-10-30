@@ -9,7 +9,14 @@ import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
-from api.connect import DESKTOP_CLIENT_ID, SpotifyError as ConnectError, _read_welcome, _solve_login5_hashcash, _trailing_zeros
+from api.connect import (
+    DESKTOP_CLIENT_ID,
+    SpotifyError as ConnectError,
+    _access_point_keys,
+    _read_welcome,
+    _solve_login5_hashcash,
+    _trailing_zeros,
+)
 from api.gateway import GatewaySession
 from api.ha import HomeAssistant
 from api.pb import Keep, decode, encode, message
@@ -17,7 +24,7 @@ from api.server import Companion, route_post
 from api.shannon import Shannon
 from api.art import THUMB_EDGE, with_edge
 from api.protocol import as_bytes, decode_frames, encode_json
-from api.spotify import CAPTURE_BACKOFF_S, SpotifySession, _track
+from api.spotify import CAPTURE_BACKOFF_S, SpotifyError, SpotifySession, _track
 from api.state import AppState
 
 TRACK_URI = "spotify:track:abc"
@@ -291,6 +298,11 @@ class SpotifyTokenTests(unittest.TestCase):
             self.assertIn(f"client_id={DESKTOP_CLIENT_ID}", seen["body"])
             self.assertNotIn("client_secret", seen["body"])
 
+    def test_access_point_key_is_inside_the_login_crypto_union(self) -> None:
+        diffie = [(0x0A, b"remote-key"), (0x1E, b"remote-signature")]
+        payload = encode([(0x0A, [(0x0A, [(0x0A, diffie)])])])
+        self.assertEqual(_access_point_keys(payload), (b"remote-key", b"remote-signature"))
+
     def test_welcome_keeps_the_reusable_credential(self) -> None:
         payload = encode([(0x0A, "canonicaluserid123"), (0x1E, 1), (0x28, b"reusable")])
         found = _read_welcome(payload)
@@ -427,11 +439,16 @@ class SpotifyTokenTests(unittest.TestCase):
             }
             session._web_gate.clock = lambda: clock[0]
             session._web_gate.sleep = sleep
+            with self.assertRaises(SpotifyError) as caught:
+                session._page("/me/playlists", 1, 0)
+            self.assertEqual(caught.exception.retry_after, 2.0)
+            with self.assertRaises(SpotifyError):
+                session._page("/me/playlists", 1, 0)
+            self.assertEqual(calls["n"], 1)
+            clock[0] = 2.0
             session._page("/me/playlists", 1, 0)
-            session._page("/me/playlists", 1, 0)
-        self.assertEqual(calls["n"], 3)
-        self.assertEqual(slept[0], 2.0)
-        self.assertGreaterEqual(slept[-1], 0.35)
+            self.assertEqual(calls["n"], 2)
+            self.assertEqual(slept, [])
 
     def test_stale_home_assistant_login_does_not_replace_a_live_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
